@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+
+"""
+The script parses the output of
+
+     smartctl -A -H HARD_DRIVE
+
+for all harddrives HARD_DRIVE specified in the [Monitored] section
+of CONFIG_FILE (default location: check_smart.conf) and prints
+output that is readable by Icinga/Nagios in the following form:
+
+    HEALTH_STATUS_STRING | MEASUREMENT_DATA
+
+where HEALTH_STATUS_STRING is either "SMART Status OK" or contains
+the failing messages in the relevant section of the smartctl output.
+MEASUREMENT_DATA is a comma-separated list of the form
+ATTRIBUTE_NAME[_normalized]=VALUE containing both raw and normalized
+attribute values.
+
+If anything of the following holds true the script exits with status
+code 2 (Critical) otherwise 0 (OK):
+
+  * the smartctl output of at least one hard drive specified in
+    CONFIG_FILE does *not* contain the string:
+    "SMART overall-health self-assessment test result: PASSED"
+
+  * There is at least one harddrive of the form /dev/sd[a-z] present
+    at the system that is neither specified in the [Monitored] nor
+    the [Ignored] section of CONFIG_FILE
+
+  * There is at least one harddrive in the [Monitored] section of
+    CONFIG_FILE that is not present at the system (e.g. has no
+    entry in /dev/)
+
+  * A hard drive is specified in both the [Monitored] and the
+    [Ignored] section of CONFIG_FILE
+"""
+
+
+import configparser
+import csv
+import io
+import os
+import re
+import sys
+from subprocess import CalledProcessError, check_output
+
+
+CONF_FILE_LOCATION = "/etc/nagios/check_smart.conf"
+
+WATCHED_ATTRIBUTES = {
+    "Reallocated_Sector_Ct"  : "Realloc_Sector",
+    "Raw_Read_Error_Rate"    : "RRER",
+    "Wear_Leveling_Count"    : "Wear_Leveling",
+    "Used_Rsvd_Blk_Cnt_Tot"  : "Used_Rsvd_Blk",
+    "Uncorrectable_Error_Cnt": "UnC_Error",
+    "Command_Timeout"        : "Cmd_Timeout",
+    "Airflow_Temperature_Cel": "Airflow_Temp",
+    "Temperature_Celsius"    : "Temp",
+    "Current_Pending_Sector" : "Cur_Pend_Sector",
+    "Offline_Uncorrectable"  : "Offline_UnC",
+    "UDMA_CRC_Error_Count"   : "UDMA_CRC_Error",
+    "Host_Writes_32MiB"      : "Host_Writes_32MB",
+    "Available_Reservd_Space": "Avail_Rsrvd_Space",
+    "Total_LBAs_Written"     : "LBAs_Written",
+    "Total_LBAs_Read"        : "LBAs_Read",
+    "Host_Reads_32MiB"       : "Host_Reads_32MB",
+    "NAND_Writes_1GiB"       : "NAND_Writes_1GB"
+}
+
+
+HEALTH_STATUS_REGEXP = r'=== START OF READ SMART DATA SECTION ===\n([^\n\n]*)\n'
+HEALTH_PASSED_LINE = "SMART overall-health self-assessment test result: PASSED"
+LINE_ABOVE_DATA_SECTION = "Vendor Specific SMART Attributes with Thresholds:\n"
+
+
+def shortname(name):
+    return WATCHED_ATTRIBUTES[name]
+
+
+def check_hd(hd_name):
+    try:
+        smart_output = check_output(["sudo", "smartctl", "-A", "-H",
+                                     "/dev/" + hd_name]).decode('utf-8')
+    except CalledProcessError as e:
+        smart_output = e.output.decode('utf-8')
+
+    try:
+        health_status_section = re.search(
+            HEALTH_STATUS_REGEXP, smart_output, re.DOTALL).group(1)
+    except AttributeError:
+        print("Coulnt't find section containing health information"
+              "for Harddrive: {}".format(hd_name))
+        sys.exit(2)
+
+    # check if the overall test is passed
+    # "SMART overall-health self-assessment test result: PASSED"
+    has_passed = health_status_section == HEALTH_PASSED_LINE
+
+    # convert the data section into an array
+    data_section = smart_output.split(LINE_ABOVE_DATA_SECTION, 1)[-1].strip()
+
+    f = io.StringIO(data_section)
+    reader = csv.reader(f, delimiter=' ', skipinitialspace=True)
+
+    # build dict from reader
+    keys = next(reader)
+    n_attributes = len(keys)
+
+    output = []
+    for row in reader:
+        output.append(dict(zip(keys, row[:n_attributes])))
+
+    # filter out not relevant attributes
+    output = [i for i in output if i.get("ATTRIBUTE_NAME")
+              in WATCHED_ATTRIBUTES]
+
+    # build nagios string and remove leading zeros for values
+    key_val_raw = [hd_name + "_" + shortname(i.get("ATTRIBUTE_NAME")) +
+                   "=" + str(int(i.get("RAW_VALUE"))) for i in output]
+    key_val_normalized = [hd_name + "_" +
+                          shortname(i.get("ATTRIBUTE_NAME")) + "_n=" +
+                          str(int(i.get("VALUE"))) for i in output]
+
+    icinga_output = " ".join(key_val_raw + key_val_normalized)
+
+    return (has_passed, icinga_output, health_status_section)
+
+
+def main():
+    # read config
+    config = configparser.ConfigParser(allow_no_value=True)
+    config.read(CONF_FILE_LOCATION)
+
+    monitored_hds = [i[0] for i in config.items('Monitored')]
+
+    try:
+        ignored_hds = [i[0] for i in config.items('Ignored')]
+    except Exception:
+        ignored_hds = []
+
+    # all harddrives named sd[a-z]
+    system_hds = [file for file in os.listdir('/dev/')
+                  if re.match(r'sd[a-z]\b', file) or
+                  re.match(r'sg[0-9]\b', file)]
+
+    # check for hard drives that are neither monitored not ignored
+    for hd in system_hds:
+        if (hd not in monitored_hds) and (hd not in ignored_hds):
+            print("ERROR: Harddrive \"{}\" is present on the system but is neither "
+                  "specified in the [Monitored] nor [Ignored] section of the "
+                  "config file \"{}\".".format(hd, CONF_FILE_LOCATION))
+            sys.exit(2)
+
+    # check for hard drives that are listed in both [Monitored] and [Ignored]
+    for hd in monitored_hds:
+        if hd in ignored_hds:
+            print("ERROR: Harddrive \"{}\" is specified in both the [Monitored] and in "
+                  "the [Ignored] section of the config file \"{}\"."
+                  .format(hd, CONF_FILE_LOCATION))
+            sys.exit(2)
+
+    # run check for all hard drives /dev/sd[a-z] if monitored
+    all_have_passed = True
+    health_failure_sections = []
+    total_data_output = []
+
+    for hd in monitored_hds:
+        if hd not in system_hds:
+            print("ERROR: Harddrive \"{}\" is specified in the [Monitored] section of "
+                  "the config file \"{}\" but is not present on the system"
+                  .format(hd, CONF_FILE_LOCATION))
+            sys.exit(2)
+
+        check_result = check_hd(hd)
+
+        has_passed = check_result[0]
+        attributes = check_result[1]
+        health_status_text = check_result[2]
+
+        # store text information for failing disks
+        if (not has_passed):
+            health_failure_sections.append(health_status_text)
+
+        total_data_output.append(attributes)
+
+        all_have_passed = all_have_passed and has_passed
+
+    # print results and exit
+    if all_have_passed:
+        print("OK |", end=' ')
+    else:
+        print("Critical: " + ",".join(health_failure_sections) + " |", end=' ')
+
+    print(" ".join(total_data_output))
+
+    # Exit with appropriate status code (0 - OK, 2 - Critical)
+    if all_have_passed:
+        sys.exit(0)
+    else:
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()
